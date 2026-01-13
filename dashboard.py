@@ -1,177 +1,192 @@
 import pandas as pd
 import numpy as np
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request
 import plotly.express as px
 import plotly.graph_objects as go
-import os
 
 app = Flask(__name__)
 
-# Load weather data
-df = pd.read_csv('weatherAUS.csv')
+# --- Data Preparation (Same as Notebook) ---
+def load_and_clean_data():
+    df = pd.read_csv('weatherAUS.csv')
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.sort_values(['Location', 'Date']).reset_index(drop=True)
+    
+    # Fill Temperature basics (Needed for scientific calculations)
+    df['MinTemp'] = df['MinTemp'].fillna(df['MinTemp'].median())
+    df['MaxTemp'] = df['MaxTemp'].fillna(df['MaxTemp'].median())
+    df['TempRange'] = df['MaxTemp'] - df['MinTemp']
+    df['TempMean'] = (df['MaxTemp'] + df['MinTemp']) / 2
+    
+    # 1. Scientific Filling for Evaporation
+    Ra = 20
+    df['Evaporation_Est'] = 0.0023 * (df['TempMean'] + 17.8) * (df['TempRange'] ** 0.5) * Ra
+    df['Evaporation'] = df['Evaporation'].fillna(df['Evaporation_Est'])
+    
+    # 2. General Null Filling
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
+    
+    categorical_cols = df.select_dtypes(include=['object']).columns
+    for col in categorical_cols:
+        df[col] = df[col].fillna(df[col].mode()[0])
+        
+    df['RainTomorrow_Binary'] = (df['RainTomorrow'] == 'Yes').astype(int)
+    return df
 
-# Data preprocessing from notebook
-df['Date'] = pd.to_datetime(df['Date'])
-df['year'] = df['Date'].dt.year
-df['month'] = df['Date'].dt.month
-df['day'] = df['Date'].dt.day
-df['season'] = df['month'] % 12 // 3 + 1
-df['weekday'] = df['Date'].dt.dayofweek
+df_analysis = load_and_clean_data()
+locations = sorted(df_analysis['Location'].unique())
 
-# Create derived features
-df['CloudMean'] = df[['Cloud9am','Cloud3pm']].mean(axis=1)
-df['TempMean'] = (df['MinTemp'] + df['MaxTemp']) / 2
-df['TempRange'] = df['MaxTemp'] - df['MinTemp']
-df['HumidityMean'] = (df['Humidity9am'] + df['Humidity3pm']) / 2
-df['TempAvg'] = (df['Temp9am'] + df['Temp3pm']) / 2
-df['WindSpeedMean'] = df[['WindSpeed9am','WindSpeed3pm','WindGustSpeed']].mean(axis=1)
-
-# Map RainTomorrow and RainToday
-df['RainTomorrowLabel'] = df['RainTomorrow']
-df['RainTomorrow'] = df['RainTomorrow'].map({'No':0,'Yes':1})
+def predict_rain_simple(row):
+    score = 0
+    if pd.notna(row['Sunshine']):
+        if row['Sunshine'] < 3: score += 35
+        elif row['Sunshine'] < 7: score += 15
+        elif row['Sunshine'] > 11: score -= 20
+    if pd.notna(row['Humidity3pm']):
+        if row['Humidity3pm'] > 80: score += 30
+        elif row['Humidity3pm'] > 70: score += 20
+    if pd.notna(row['Cloud3pm']):
+        if row['Cloud3pm'] >= 7: score += 25
+        elif row['Cloud3pm'] >= 5: score += 10
+    if row['RainToday'] == 'Yes': score += 20
+    
+    if score >= 60: return 'Very High Probability (>60%)', 'danger'
+    elif score >= 40: return 'High Probability (40-60%)', 'warning'
+    elif score >= 25: return 'Medium Probability (25-40%)', 'info'
+    else: return 'Low Probability (<25%)', 'success'
 
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Weather Dashboard</title>
+    <title>Weather Rain Predictor</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body { font-family: Arial; padding: 20px; background: #f5f5f5; }
-        h1 { text-align: center; }
-        .chart { background: white; margin: 20px auto; padding: 10px; max-width: 1200px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        body { background-color: #f8f9fa; padding-top: 20px; }
+        .dashboard-container { max-width: 1200px; margin: auto; }
+        .card { margin-bottom: 20px; border: none; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .prediction-box { padding: 30px; border-radius: 15px; text-align: center; color: white; }
+        .stat-value { font-size: 1.8rem; font-weight: bold; color: #0d6efd; }
+        .bg-danger { background-color: #dc3545 !important; }
+        .bg-warning { background-color: #ffc107 !important; color: black !important; }
+        .bg-info { background-color: #0dcaf0 !important; color: black !important; }
+        .bg-success { background-color: #198754 !important; }
     </style>
 </head>
 <body>
-    <h1>Weather Australia Analysis</h1>
-    <div class="chart">{{ chart1 | safe }}</div>
-    <div class="chart">{{ chart2 | safe }}</div>
-    <div class="chart">{{ chart3 | safe }}</div>
-    <div class="chart">{{ chart4 | safe }}</div>
-    <div class="chart">{{ chart5 | safe }}</div>
-    <div class="chart">{{ chart6 | safe }}</div>
-    <div class="chart">{{ chart7 | safe }}</div>
-    <div class="chart">{{ chart8 | safe }}</div>
-    <div class="chart">{{ chart9 | safe }}</div>
-    <div class="chart">{{ chart10 | safe }}</div>
-    <div class="chart">{{ chart11 | safe }}</div>
-    <div class="chart">{{ chart12 | safe }}</div>
+    <div class="container dashboard-container">
+        <h1 class="text-center mb-4">Weather Prediction Dashboard</h1>
+        
+        <div class="card p-3">
+            <form action="/" method="get" class="row g-3 align-items-center justify-content-center">
+                <div class="col-auto">
+                    <label class="form-label h5 mb-0">Select Your City:</label>
+                </div>
+                <div class="col-auto">
+                    <select name="location" class="form-select form-select-lg" onchange="this.form.submit()">
+                        {% for loc in locations %}
+                        <option value="{{ loc }}" {% if loc == selected_location %}selected{% endif %}>{{ loc }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </form>
+        </div>
+
+        <div class="row">
+            <div class="col-md-4">
+                <div class="card p-3 text-center">
+                    <h5>Sunshine Today</h5>
+                    <div class="stat-value">{{ "%.1f"|format(current_stats.Sunshine) }} h</div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card p-3 text-center">
+                    <h5>Humidity (3pm)</h5>
+                    <div class="stat-value">{{ "%.0f"|format(current_stats.Humidity3pm) }} %</div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card p-3 text-center">
+                    <h5>Cloud Cover</h5>
+                    <div class="stat-value">{{ "%.0f"|format(current_stats.Cloud3pm) }}/8</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card prediction-box bg-{{ pred_color }}">
+            <h3>Verdict for {{ selected_location }} tomorrow:</h3>
+            <h1 class="display-4 font-weight-bold">{{ prediction }}</h1>
+            <p class="mb-0">Latest update: {{ last_date }}</p>
+        </div>
+
+        <div class="row">
+            <div class="col-md-6"><div class="card p-2">{{ chart1 | safe }}</div></div>
+            <div class="col-md-6"><div class="card p-2">{{ chart2 | safe }}</div></div>
+            <div class="col-12"><div class="card p-2">{{ chart3 | safe }}</div></div>
+        </div>
+    </div>
 </body>
 </html>
 '''
 
 @app.route('/')
 def dashboard():
-    # 1. TempMean vs RainTomorrow - Box plot
-    fig1 = px.box(df, x='RainTomorrowLabel', y='TempMean', 
-                  title='Temperature Mean vs Rain Tomorrow',
-                  color='RainTomorrowLabel',
-                  color_discrete_sequence=px.colors.qualitative.Set2,
-                  labels={'RainTomorrowLabel': 'Rain Tomorrow', 'TempMean': 'Temperature Mean (°C)'})
+    selected_location = request.args.get('location', 'Sydney')
     
-    # 2. HumidityMean vs RainTomorrow - Box plot
-    fig2 = px.box(df, x='RainTomorrowLabel', y='HumidityMean',
-                  title='Humidity Mean vs Rain Tomorrow',
-                  color='RainTomorrowLabel',
-                  color_discrete_sequence=px.colors.qualitative.Pastel,
-                  labels={'RainTomorrowLabel': 'Rain Tomorrow', 'HumidityMean': 'Humidity Mean (%)'})
+    # Filter data
+    df_loc = df_analysis[df_analysis['Location'] == selected_location].sort_values('Date')
+    current_day = df_loc.iloc[-1]
     
-    # 3. Evaporation Distribution by RainTomorrow
-    fig3 = px.histogram(df, x='Evaporation', color='RainTomorrowLabel', 
-                       nbins=30, barmode='overlay', opacity=0.6,
-                       title='Evaporation Distribution by Rain Tomorrow',
-                       color_discrete_sequence=['#87CEEB', '#FF8C00'],
-                       labels={'Evaporation': 'Evaporation (mm)', 'RainTomorrowLabel': 'Rain Tomorrow'})
+    # Prediction
+    pred_text, pred_color = predict_rain_simple(current_day)
     
-    # 4. TempAvg Distribution by RainTomorrow
-    fig4 = px.histogram(df, x='TempAvg', color='RainTomorrowLabel',
-                       nbins=30, barmode='overlay', opacity=0.6,
-                       title='Temperature Average Distribution by Rain Tomorrow',
-                       color_discrete_sequence=['#90EE90', '#FA8072'],
-                       labels={'TempAvg': 'Temperature Average (°C)', 'RainTomorrowLabel': 'Rain Tomorrow'})
+    # Chart 1: Sunshine (Density)
+    fig1 = px.histogram(df_loc, x='Sunshine', color='RainTomorrow', 
+                       marginal='box', barmode='overlay',
+                       title=f'Historical Sunshine Distribution: {selected_location}',
+                       color_discrete_map={'No': '#0d6efd', 'Yes': '#dc3545'},
+                       template='simple_white')
+    fig1.add_vline(x=current_day['Sunshine'], line_dash="dash", line_color="black", 
+                  annotation_text="TODAY'S LEVEL", annotation_position="top left")
+
+    # Chart 2: Humidity (Density)
+    fig2 = px.histogram(df_loc, x='Humidity3pm', color='RainTomorrow',
+                       marginal='box', barmode='overlay',
+                       title=f'Historical Humidity Distribution: {selected_location}',
+                       color_discrete_map={'No': '#0d6efd', 'Yes': '#dc3545'},
+                       template='simple_white')
+    fig2.add_vline(x=current_day['Humidity3pm'], line_dash="dash", line_color="black",
+                  annotation_text="TODAY'S LEVEL", annotation_position="top left")
+
+    # Chart 3: Cloud Cover vs Chance
+    cloud_prob = df_loc.groupby('Cloud3pm')['RainTomorrow_Binary'].mean() * 100
+    fig3 = go.Figure()
+    fig3.add_trace(go.Bar(x=cloud_prob.index, y=cloud_prob.values, marker_color='lightgray', name='History'))
     
-    # 5. RainTomorrow Distribution by Location
-    location_counts = df.groupby(['Location', 'RainTomorrowLabel']).size().reset_index(name='Count')
-    fig5 = px.bar(location_counts, x='Location', y='Count', color='RainTomorrowLabel',
-                  barmode='group', title='Rain Tomorrow Distribution by Location',
-                  color_discrete_sequence=px.colors.qualitative.Bold,
-                  labels={'RainTomorrowLabel': 'Rain Tomorrow'})
-    fig5.update_layout(xaxis_tickangle=45, height=600)
-    
-    # 6. RainTomorrow Distribution by Day of Month
-    day_counts = df.groupby(['day', 'RainTomorrowLabel']).size().reset_index(name='Count')
-    fig6 = px.bar(day_counts, x='day', y='Count', color='RainTomorrowLabel',
-                  barmode='group', title='Rain Tomorrow Distribution by Day of Month',
-                  color_discrete_sequence=px.colors.qualitative.Safe,
-                  labels={'day': 'Day of Month', 'RainTomorrowLabel': 'Rain Tomorrow'})
-    
-    # 7. RainTomorrow Distribution by Season
-    season_counts = df.groupby(['season', 'RainTomorrowLabel']).size().reset_index(name='Count')
-    season_map = {1: 'Summer', 2: 'Fall', 3: 'Winter', 4: 'Spring'}
-    season_counts['season_label'] = season_counts['season'].map(season_map)
-    fig7 = px.bar(season_counts, x='season_label', y='Count', color='RainTomorrowLabel',
-                  barmode='group', title='Rain Tomorrow Distribution by Season',
-                  color_discrete_sequence=px.colors.qualitative.Vivid,
-                  labels={'season_label': 'Season', 'RainTomorrowLabel': 'Rain Tomorrow'})
-    
-    # 8. Average Evaporation per Weekday
-    evap_weekday = df.groupby('weekday')['Evaporation'].mean().reset_index()
-    weekday_map = {0: 'Mon', 1: 'Tue', 2: 'Wed', 3: 'Thu', 4: 'Fri', 5: 'Sat', 6: 'Sun'}
-    evap_weekday['weekday_label'] = evap_weekday['weekday'].map(weekday_map)
-    fig8 = px.bar(evap_weekday, x='weekday_label', y='Evaporation',
-                  title='Average Evaporation per Weekday',
-                  labels={'weekday_label': 'Weekday', 'Evaporation': 'Evaporation (mm)'},
-                  color='Evaporation', color_continuous_scale='teal')
-    
-    # 9. Average Evaporation per Month
-    month_evap = df.groupby('month')['Evaporation'].mean().reset_index()
-    month_map = {1: 'Jan', 2: 'Feb', 3: 'Mar', 4: 'Apr', 5: 'May', 6: 'Jun',
-                 7: 'Jul', 8: 'Aug', 9: 'Sep', 10: 'Oct', 11: 'Nov', 12: 'Dec'}
-    month_evap['month_label'] = month_evap['month'].map(month_map)
-    fig9 = px.bar(month_evap, x='month_label', y='Evaporation',
-                  title='Average Evaporation per Month',
-                  labels={'month_label': 'Month', 'Evaporation': 'Evaporation (mm)'},
-                  color='Evaporation', color_continuous_scale='sunset')
-    
-    # 10. Average Evaporation per Year
-    year_evap = df.groupby('year')['Evaporation'].mean().reset_index()
-    fig10 = px.bar(year_evap, x='year', y='Evaporation',
-                   title='Average Evaporation per Year',
-                   labels={'year': 'Year', 'Evaporation': 'Evaporation (mm)'},
-                   color='Evaporation', color_continuous_scale='plasma')
-    
-    # 11. Evaporation vs Humidity 3pm
-    fig11 = px.scatter(df.dropna(subset=['Humidity3pm', 'Evaporation']), 
-                      x='Humidity3pm', y='Evaporation', color='RainTomorrowLabel',
-                      title='Evaporation vs Humidity 3pm',
-                      color_discrete_sequence=px.colors.qualitative.D3,
-                      labels={'Humidity3pm': 'Humidity 3pm (%)', 'Evaporation': 'Evaporation (mm)',
-                              'RainTomorrowLabel': 'Rain Tomorrow'},
-                      opacity=0.6)
-    
-    # 12. Evaporation vs Sunshine
-    fig12 = px.scatter(df.dropna(subset=['Sunshine', 'Evaporation']), 
-                      x='Sunshine', y='Evaporation', color='RainTomorrowLabel',
-                      title='Evaporation vs Sunshine',
-                      color_discrete_sequence=px.colors.qualitative.T10,
-                      labels={'Sunshine': 'Sunshine (hours)', 'Evaporation': 'Evaporation (mm)',
-                              'RainTomorrowLabel': 'Rain Tomorrow'},
-                      opacity=0.6)
-    
+    # Highlight today's cloud
+    today_cloud = int(current_day['Cloud3pm'])
+    if today_cloud in cloud_prob.index:
+        fig3.add_trace(go.Bar(x=[today_cloud], y=[cloud_prob.loc[today_cloud]], 
+                           marker_color='#fd7e14', name='TODAY'))
+        
+    fig3.update_layout(title=f'Rain Probability (%) by Cloud Cover: {selected_location}',
+                      xaxis_title='Cloud Cover (0-8)', yaxis_title='Chance of Rain (%)',
+                      template='simple_white', showlegend=False)
+
     return render_template_string(HTML_TEMPLATE,
+        locations=locations,
+        selected_location=selected_location,
+        current_stats=current_day,
+        prediction=pred_text,
+        pred_color=pred_color,
+        last_date=current_day['Date'].strftime('%d %B %Y'),
         chart1=fig1.to_html(full_html=False),
         chart2=fig2.to_html(full_html=False),
-        chart3=fig3.to_html(full_html=False),
-        chart4=fig4.to_html(full_html=False),
-        chart5=fig5.to_html(full_html=False),
-        chart6=fig6.to_html(full_html=False),
-        chart7=fig7.to_html(full_html=False),
-        chart8=fig8.to_html(full_html=False),
-        chart9=fig9.to_html(full_html=False),
-        chart10=fig10.to_html(full_html=False),
-        chart11=fig11.to_html(full_html=False),
-        chart12=fig12.to_html(full_html=False)
+        chart3=fig3.to_html(full_html=False)
     )
 
 if __name__ == '__main__':
-    print("Weather Dashboard: http://localhost:5000")
-    app.run(debug=False, port=5000)
+    print("Dashboard starting on http://localhost:5000")
+    app.run(debug=True, port=5000)
+
