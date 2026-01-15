@@ -400,10 +400,6 @@ HTML_TEMPLATE = '''
                 </div>
                 <div class="text-muted mb-3">Chance of Rain</div>
                 
-                <span class="confidence-badge">
-                    Confidence: {{ "%.0f"|format(preds.day1.conf) }}%
-                </span>
-
                 {% if display.day1_res %}
                 <div class="result-box {{ display.day1_cls }}">
                     <i class="bi {{ display.day1_icon }}"></i>
@@ -428,10 +424,6 @@ HTML_TEMPLATE = '''
                 </div>
                 <div class="text-muted mb-3">Chance of Rain</div>
                 
-                <span class="confidence-badge">
-                    Confidence: {{ "%.0f"|format(preds.day2.conf) }}%
-                </span>
-
                 {% if display.day2_res %}
                 <div class="result-box {{ display.day2_cls }}">
                     <i class="bi {{ display.day2_icon }}"></i>
