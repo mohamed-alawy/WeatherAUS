@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from flask import Flask, render_template_string, request
 from datetime import timedelta
 import plotly.express as px
@@ -9,9 +10,23 @@ pio.templates.default = "plotly_dark"
 app = Flask(__name__)
 
 def load_data():
-    df = pd.read_csv('weatherAUS_cleaned.csv')
+    try:
+        df = pd.read_csv('weatherAUS_cleaned.csv')
+    except FileNotFoundError:
+        # Fallback for dev if cleaned not found, try original
+        df = pd.read_csv('weatherAUS.csv')
+
     df['Date'] = pd.to_datetime(df['Date'])
     df['Month'] = df['Date'].dt.month_name()
+    
+    # Ensure Binary targets exist and are integers (0/1)
+    if 'RainToday' in df.columns:
+        # Standardize: Yes->1, No->0. Handle potential NaNs as 0 (safe default for plotting, though maybe risky for ML)
+        df['RainToday_Binary'] = df['RainToday'].map({'Yes': 1, 'No': 0}).fillna(0).astype(int)
+    
+    if 'RainTomorrow' in df.columns:
+        df['RainTomorrow_Binary'] = df['RainTomorrow'].map({'Yes': 1, 'No': 0}).fillna(0).astype(int)
+
     df = df.sort_values(['Location', 'Date']).reset_index(drop=True)
     return df
 
@@ -22,17 +37,19 @@ max_date = df['Date'].max().strftime('%Y-%m-%d')
 
 def predict_next_2_days(df_loc, current_date_row):
     # Extract current features
-    sun = current_date_row['Sunshine']
-    hum = current_date_row['Humidity3pm']
-    cld = current_date_row['Cloud3pm']
-    rt = 1 if current_date_row['RainToday'] == 'Yes' else 0
+    # Use fillna(0) for safety
+    sun = float(current_date_row['Sunshine']) if pd.notnull(current_date_row['Sunshine']) else 0.0
+    hum = float(current_date_row['Humidity3pm']) if pd.notnull(current_date_row['Humidity3pm']) else 0.0
+    cld = float(current_date_row['Cloud3pm']) if pd.notnull(current_date_row['Cloud3pm']) else 0.0
+    rt = int(current_date_row['RainToday_Binary']) if pd.notnull(current_date_row['RainToday_Binary']) else 0
     
     # 1. Day 1 Logic
     # Find similar historical days (including cloud)
+    # Using explicit .copy() to avoid SettingWithCopy warnings if we modify matches later
     mask1 = (
         (df_loc['Sunshine'].between(sun - 3, sun + 3)) &
         (df_loc['Humidity3pm'].between(hum - 15, hum + 15)) &
-        (df_loc['Cloud3pm'].between(cld - 1, cld + 1)) &
+        (df_loc['Cloud3pm'].between(cld - 2, cld + 2)) &
         (df_loc['RainToday_Binary'] == rt)
     )
     matches1 = df_loc[mask1]
@@ -42,7 +59,7 @@ def predict_next_2_days(df_loc, current_date_row):
         mask1_broad = (
             (df_loc['Sunshine'].between(sun - 6, sun + 6)) &
             (df_loc['Humidity3pm'].between(hum - 30, hum + 30)) &
-            (df_loc['Cloud3pm'].between(cld - 2, cld + 2)) &
+            (df_loc['Cloud3pm'].between(cld - 3, cld + 3)) &
             (df_loc['RainToday_Binary'] == rt)
         )
         matches1 = df_loc[mask1_broad]
@@ -73,7 +90,7 @@ def predict_next_2_days(df_loc, current_date_row):
     mask2 = (
         (df_loc['Sunshine'].between(est_sun_tom - 4, est_sun_tom + 4)) &
         (df_loc['Humidity3pm'].between(est_hum_tom - 20, est_hum_tom + 20)) &
-        (df_loc['Cloud3pm'].between(est_cld_tom - 2, est_cld_tom + 2)) &
+        (df_loc['Cloud3pm'].between(est_cld_tom - 3, est_cld_tom + 3)) &
         (df_loc['RainToday_Binary'] == day1_outcome)
     )
     matches2 = df_loc[mask2]
@@ -90,59 +107,186 @@ def predict_next_2_days(df_loc, current_date_row):
         'day2': {'prob': prob2, 'conf': conf2}
     }
 
-def create_charts(df_loc):
-    # 1. Cloud Cover vs Rain Probability (Bar)
-    cloud_gb = df_loc.groupby('Cloud3pm')['RainTomorrow_Binary'].mean().reset_index()
-    cloud_gb['RainProb'] = cloud_gb['RainTomorrow_Binary'] * 100
+def create_charts(df_loc, current_day=None):
+    # Use nice hex colors for the dashboard
+    COLOR_SUN = '#F59E0B' # Amber
+    COLOR_HUM = '#3B82F6' # Blue
+    COLOR_CLD = '#64748B' # Slate
+    COLOR_YES = '#EF4444' # Red
+    COLOR_NO = '#10B981'  # Green
+    COLOR_MONTH = '#8B5CF6' # Violet
+
+    # 1. Sunshine vs Rain Prob (Line Chart / Area)
+    # Strategy: Round sunshine to nearest integer to group data, then plot trend
+    # CRITICAL FIX: Drop NaNs. Do NOT fill with 0. 0 means overcast, NaN means unknown.
+    df_sun = df_loc.dropna(subset=['Sunshine']).copy()
     
-    fig1 = px.bar(
-        cloud_gb, x='Cloud3pm', y='RainProb',
-        title=f"Cloud Cover Impact",
-        labels={'Cloud3pm': 'Cloud Cover (0-8)', 'RainProb': 'Rain Probability (%)'},
-        color='RainProb', color_continuous_scale='RdBu_r'
-    )
-    fig1.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white")
+    if not df_sun.empty:
+        df_sun['Sun_Round'] = df_sun['Sunshine'].round(0)
+        # Group and calculate mean
+        sun_groups = df_sun.groupby('Sun_Round')['RainTomorrow_Binary'].mean() * 100
+        
+        # Reindex to ensure we have a continuous x-axis (0 to max sun)
+        max_sun = int(df_sun['Sunshine'].max()) if not df_sun.empty else 14
+        idx_sun = np.arange(0, max_sun + 1)
+        sun_groups = sun_groups.reindex(idx_sun)
+        
+        # Interpolate to fill gaps for a smooth line
+        sun_groups_interp = sun_groups.interpolate(method='linear')
+    else:
+        sun_groups_interp = pd.Series([], dtype=float)
 
-    # 2. Humidity Distribution (Violin/Box)
-    fig2 = px.box(
-        df_loc, x='RainTomorrow', y='Humidity3pm',
-        color='RainTomorrow',
-        title="Humidity Dist. by Rain Outcome",
-        labels={'Humidity3pm': 'Humidity 3pm (%)'},
-        color_discrete_map={'Yes': '#FF6B6B', 'No': '#4ECDC4'}
+    fig1 = px.area(
+        x=sun_groups_interp.index, y=sun_groups_interp.values,
+        title='Sunshine vs Rain Probability',
+        labels={'x': 'Sunshine (Hours)', 'y': 'Rain Probability (%)'},
     )
-    fig2.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white")
-
-    # 3. Sunshine vs Rain (Histogram)
-    fig3 = px.histogram(
-        df_loc, x='Sunshine', color='RainTomorrow',
-        barmode='overlay', opacity=0.75,
-        title="Sunshine Hours Distribution",
-        color_discrete_map={'Yes': '#FF6B6B', 'No': '#4ECDC4'}
+    fig1.update_traces(line_color=COLOR_SUN, fill='tozeroy', fillcolor='rgba(245, 158, 11, 0.1)')
+    fig1.update_layout(
+        yaxis=dict(range=[0,105], showgrid=True, gridcolor='rgba(255,255,255,0.05)'),
+        xaxis=dict(showgrid=False),
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+        font=dict(color='#e2e8f0', family='Outfit'),
+        margin=dict(t=40, b=30, l=40, r=20)
     )
-    fig3.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white")
 
-    # 4. Seasonality (Line)
-    # Ensure correct month order
-    month_order = ['January', 'February', 'March', 'April', 'May', 'June', 
+    # Add marker for current day
+    if current_day is not None and pd.notnull(current_day['Sunshine']):
+        val = round(current_day['Sunshine'])
+        if val in sun_groups_interp.index:
+            y_val = sun_groups_interp.loc[val]
+            if pd.notnull(y_val):
+                fig1.add_scatter(x=[val], y=[y_val], mode='markers', marker=dict(color='white', size=10, line=dict(color=COLOR_SUN, width=2)), showlegend=False, name='Current Day')
+
+    # 2. Humidity vs Rain Prob (Line Chart / Area)
+    # Round to nearest 2% for granularity
+    df_hum = df_loc.dropna(subset=['Humidity3pm']).copy()
+    
+    if not df_hum.empty:
+        df_hum['Hum_Round'] = (df_hum['Humidity3pm'] / 2).round() * 2
+        hum_groups = df_hum.groupby('Hum_Round')['RainTomorrow_Binary'].mean() * 100
+        
+        # Reindex 0-100
+        idx_hum = np.arange(0, 102, 2)
+        hum_groups = hum_groups.reindex(idx_hum)
+        hum_groups_interp = hum_groups.interpolate(method='linear')
+    else:
+        hum_groups_interp = pd.Series([], dtype=float)
+        
+    fig2 = px.area(
+        x=hum_groups_interp.index, y=hum_groups_interp.values,
+        title='Humidity (3pm) vs Rain Probability',
+        labels={'x': 'Humidity (%)', 'y': 'Rain Probability (%)'},
+    )
+    fig2.update_traces(line_color=COLOR_HUM, fill='tozeroy', fillcolor='rgba(59, 130, 246, 0.1)')
+    fig2.update_layout(
+        yaxis=dict(range=[0,105], showgrid=True, gridcolor='rgba(255,255,255,0.05)'),
+        xaxis=dict(showgrid=False),
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+        font=dict(color='#e2e8f0', family='Outfit'),
+        margin=dict(t=40, b=30, l=40, r=20)
+    )
+    
+    # Add marker for current day
+    if current_day is not None and pd.notnull(current_day['Humidity3pm']):
+        val = 2 * round(current_day['Humidity3pm']/2)
+        if val in hum_groups_interp.index:
+            y_val = hum_groups_interp.loc[val]
+            if pd.notnull(y_val):
+                fig2.add_scatter(x=[val], y=[y_val], mode='markers', marker=dict(color='white', size=10, line=dict(color=COLOR_HUM, width=2)), showlegend=False, name='Current Day')
+
+    # 3. Cloud Cover (Bar - Discrete)
+    # Just clean it up
+    cld_groups = df_loc.groupby('Cloud3pm')['RainTomorrow_Binary'].mean() * 100
+    cld_groups = cld_groups.reindex(np.arange(0,9), fill_value=0)
+    
+    fig3 = px.bar(
+        x=cld_groups.index, y=cld_groups.values,
+        title='Cloud Cover (3pm) vs Rain',
+        labels={'x': 'Cloud Cover (Okta)', 'y': 'Rain Probability (%)'},
+        text=cld_groups.values
+    )
+    fig3.update_traces(marker_color=COLOR_CLD, texttemplate='%{text:.0f}%', textposition='outside')
+    fig3.update_layout(
+        yaxis=dict(range=[0,115], showgrid=True, gridcolor='rgba(255,255,255,0.05)'),
+        xaxis=dict(tickmode='array', tickvals=list(range(9))),
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+        font=dict(color='#e2e8f0', family='Outfit'),
+        margin=dict(t=40, b=30, l=40, r=20)
+    )
+    
+    if current_day is not None and pd.notnull(current_day['Cloud3pm']):
+        val = int(current_day['Cloud3pm'])
+        if 0 <= val <= 8:
+             fig3.add_shape(type="rect", x0=val-0.45, x1=val+0.45, y0=0, y1=100, 
+                           line=dict(color="#FDB813", width=2, dash="dot"), fillcolor="rgba(0,0,0,0)")
+
+    # 4. Persistence (RainToday vs RainTomorrow)
+    rain_perm = df_loc.groupby('RainToday')['RainTomorrow_Binary'].mean() * 100
+    x_perm = ['No', 'Yes']
+    y_perm = [rain_perm.get('No', 0), rain_perm.get('Yes', 0)]
+    
+    fig4 = px.bar(
+        x=x_perm, y=y_perm,
+        title='Rain Persistence',
+        labels={'x': 'Rain Today?', 'y': 'Probability Prediction'},
+        text=[f"{v:.1f}%" for v in y_perm],
+        color=x_perm,
+        color_discrete_map={'No': COLOR_NO, 'Yes': COLOR_YES}
+    )
+    fig4.update_traces(textposition='outside')
+    fig4.update_layout(
+         yaxis=dict(range=[0,115], showgrid=True, gridcolor='rgba(255,255,255,0.05)'),
+         showlegend=False,
+         paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+         font=dict(color='#e2e8f0', family='Outfit'),
+         margin=dict(t=40, b=30, l=40, r=20)
+    )
+
+    # 5. Monthly Seasonality (Line Chart)
+    month_order = ['January', 'February', 'March', 'April', 'May', 'June',
                    'July', 'August', 'September', 'October', 'November', 'December']
+    monthly = df_loc.groupby('Month')['RainTomorrow_Binary'].mean().reindex(month_order) * 100
     
-    monthly = df_loc.groupby('Month')['RainTomorrow_Binary'].mean().reindex(month_order).reset_index()
-    monthly['RainProb'] = monthly['RainTomorrow_Binary'] * 100
-    
-    fig4 = px.line(
-        monthly, x='Month', y='RainProb',
-        title="Monthly Rain Seasonality",
-        markers=True,
-        line_shape='spline'
+    # Use spline for smooth monthly transition curve
+    fig5 = px.line(
+        x=month_order, y=monthly.values,
+        title='Monthly Rain Seasonality',
+        labels={'x': 'Month', 'y': 'Rain Probability (%)'},
+        markers=True
     )
-    fig4.update_traces(line_color='#FFE66D', line_width=4)
-    fig4.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white")
+    fig5.update_traces(
+        line_color=COLOR_MONTH, 
+        line_shape='spline', 
+        line_width=4,
+        marker_size=8,
+        marker_color='white',
+        marker_line_width=2,
+        marker_line_color=COLOR_MONTH
+    )
+    # Add an area fill
+    fig5.add_trace(px.area(x=month_order, y=monthly.values).data[0])
+    fig5.data[1].update(line=dict(width=0), fillcolor='rgba(139, 92, 246, 0.1)', hoverinfo='skip', showlegend=False)
+    
+    fig5.update_layout(
+        yaxis=dict(range=[0,105], showgrid=True, gridcolor='rgba(255,255,255,0.05)'),
+        xaxis=dict(showgrid=False),
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+        font=dict(color='#e2e8f0', family='Outfit'),
+        margin=dict(t=40, b=80, l=40, r=40)
+    )
+    
+    if current_day is not None:
+         curr_m = current_day['Month']
+         if curr_m in month_order:
+             val = monthly[curr_m]
+             fig5.add_scatter(x=[curr_m], y=[val], mode='markers', marker=dict(color='white', size=14, line=dict(color=COLOR_MONTH, width=3)), showlegend=False)
 
     return [fig1.to_html(full_html=False, config={'displayModeBar': False}),
             fig2.to_html(full_html=False, config={'displayModeBar': False}),
             fig3.to_html(full_html=False, config={'displayModeBar': False}),
-            fig4.to_html(full_html=False, config={'displayModeBar': False})]
+            fig4.to_html(full_html=False, config={'displayModeBar': False}),
+            fig5.to_html(full_html=False, config={'displayModeBar': False})]
 
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -310,6 +454,13 @@ HTML_TEMPLATE = '''
         .result-correct { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
         .result-wrong { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
         .result-future { background: rgba(255, 255, 255, 0.05); color: var(--text-muted); border: 1px dashed rgba(255, 255, 255, 0.1); }
+        
+        /* New Layout for Charts */
+        .chart-container {
+            position: relative;
+            border-radius: 16px;
+            overflow: hidden;
+        }
 
     </style>
 </head>
@@ -395,9 +546,12 @@ HTML_TEMPLATE = '''
                 <h5 class="text-primary mb-1">Tomorrow</h5>
                 <div class="text-muted small">{{ display.day1_date }}</div>
                 
-                <div class="prob-value {% if preds.day1.prob > 50 %}text-danger{% else %}text-success{% endif %}">
-                    {{ "%.0f"|format(preds.day1.prob) }}%
-                </div>
+                {% if preds.day1.prob > 50 %}
+                <div class="prob-value text-danger">{{ "%.0f"|format(preds.day1.prob) }}%</div>
+                {% else %}
+                <div class="prob-value text-success">{{ "%.0f"|format(preds.day1.prob) }}%</div>
+                {% endif %}
+                
                 <div class="text-muted mb-3">Chance of Rain</div>
                 
                 {% if display.day1_res %}
@@ -419,9 +573,12 @@ HTML_TEMPLATE = '''
                 <h5 style="color: #8b5cf6;" class="mb-1">Day After Tomorrow</h5>
                 <div class="text-muted small">{{ display.day2_date }}</div>
                 
-                <div class="prob-value {% if preds.day2.prob > 50 %}text-danger{% else %}text-success{% endif %}">
-                    {{ "%.0f"|format(preds.day2.prob) }}%
-                </div>
+                {% if preds.day2.prob > 50 %}
+                <div class="prob-value text-danger">{{ "%.0f"|format(preds.day2.prob) }}%</div>
+                {% else %}
+                <div class="prob-value text-success">{{ "%.0f"|format(preds.day2.prob) }}%</div>
+                {% endif %}
+
                 <div class="text-muted mb-3">Chance of Rain</div>
                 
                 {% if display.day2_res %}
@@ -442,23 +599,32 @@ HTML_TEMPLATE = '''
     <h4 class="mb-4 ps-2 border-start border-4 border-primary">Deep Analysis</h4>
     <div class="row g-4 row-cols-1 row-cols-lg-2">
         <div class="col">
-            <div class="glass-card p-2 h-100">
+            <div class="glass-card p-2 h-100 chart-container">
                 {{ charts[0] | safe }}
             </div>
         </div>
         <div class="col">
-            <div class="glass-card p-2 h-100">
+            <div class="glass-card p-2 h-100 chart-container">
                 {{ charts[1] | safe }}
             </div>
         </div>
         <div class="col">
-            <div class="glass-card p-2 h-100">
+            <div class="glass-card p-2 h-100 chart-container">
                 {{ charts[2] | safe }}
             </div>
         </div>
         <div class="col">
-            <div class="glass-card p-2 h-100">
+            <div class="glass-card p-2 h-100 chart-container">
                 {{ charts[3] | safe }}
+            </div>
+        </div>
+    </div>
+
+    <!-- Full-width Monthly Chart -->
+    <div class="row mt-4">
+        <div class="col-12">
+            <div class="glass-card p-3 h-100 chart-container">
+                {{ charts[4] | safe }}
             </div>
         </div>
     </div>
@@ -510,10 +676,11 @@ def index():
         current_day = df_loc.iloc[-1]
 
     # 3. Predict
+    # Use helper to get probabilities
     preds = predict_next_2_days(df_loc, current_day)
     
-    # 4. Generate Charts
-    charts_html = create_charts(df_loc)
+    # 4. Generate Charts (highlight selected day's values)
+    charts_html = create_charts(df_loc, current_day)
     
     # 5. Verification Logic
     d1_date = sel_date + timedelta(days=1)
@@ -529,9 +696,6 @@ def index():
     row_d1 = df_loc[df_loc['Date'] == d1_date]
     if not row_d1.empty:
         actual = row_d1.iloc[0]['RainToday'] # Rain for that day
-        # NOTE: Dataset RainTomorrow is for next day. 
-        # But for verification, if we predicted for d1, we check d1's RainToday or previous day's RainTomorrow?
-        # Simpler: Check d1's 'RainToday' value which tells if it rained on d1.
         
         display_info['day1_res'] = True
         display_info['day1_val'] = actual
